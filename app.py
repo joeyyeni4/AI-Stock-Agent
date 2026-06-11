@@ -26,7 +26,7 @@ def analyze_stock(symbol, api_key):
         
         # 準備 AI 提示詞
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-pro')
         
         prompt = f"""
         你是一位專業的台股分析師。請分析 {symbol}。
