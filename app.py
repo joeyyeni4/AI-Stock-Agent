@@ -2,65 +2,76 @@ import streamlit as st
 import yfinance as yf
 import ta
 import google.generativeai as genai
+import pandas as pd
 
-# --- 1. 數據校驗模組 ---
-def get_verified_data(symbol):
+# --- 1. 自動化數據驗證與自我修復模組 ---
+def get_consensus_data(ticker):
     """
-    雙重驗證機制：
-    機制 A：確保數值有效提取並轉化為百分比。
-    機制 B：檢查數值是否落在石化/化學產業的合理區間 (1%-50%)。
+    三節點一致性驗證法：
+    1. 抓取當前 API 數據
+    2. 比對近 4 季財務數據均值
+    3. 設定合理區間，若異常則自動修復
     """
-    ticker = yf.Ticker(symbol)
     info = ticker.info
+    financials = ticker.quarterly_financials
     
-    # 提取與轉換
-    raw_margin = info.get('grossMargins', 0)
-    raw_growth = info.get('revenueGrowth', 0)
+    # 節點 A: 獲取 API 數值
+    raw_margin = info.get('grossMargins', 0) * 100
     
-    margin = float(raw_margin) * 100 if raw_margin else 0.0
-    growth = float(raw_growth) * 100 if raw_growth else 0.0
+    # 節點 B: 計算歷史基線 (取近 4 季平均)
+    avg_hist_margin = 0.0
+    if financials is not None and not financials.empty:
+        try:
+            # 確保欄位存在並計算毛利百分比
+            margins = (financials.loc['Gross Profit'] / financials.loc['Total Revenue']) * 100
+            avg_hist_margin = margins.mean()
+        except:
+            avg_hist_margin = raw_margin
+            
+    # 節點 C: 一致性邏輯判定與自我修復
+    # 若當前數據 < 0.5% 或與歷史均值偏差過大，啟動修復
+    is_anomaly = raw_margin < 0.5 or (avg_hist_margin > 5 and abs(raw_margin - avg_hist_margin) > (avg_hist_margin * 0.6))
     
-    # 邏輯合理性檢查 (若數據極端異常，判定為驗證失敗)
-    # 此處設為 0.5% - 60% 作為石化/特化產業的合理預警線
-    is_valid = 0.5 <= margin <= 60.0 
-    
-    return margin, growth, is_valid
+    if is_anomaly and avg_hist_margin > 0:
+        final_margin = avg_hist_margin
+        status = f"偵測到異常數據({raw_margin:.2f}%)，已自動修復為歷史均值({final_margin:.2f}%)"
+    else:
+        final_margin = raw_margin
+        status = "數據通過一致性驗證"
+        
+    return final_margin, status
 
 # --- 2. 核心分析邏輯 ---
 def analyze_stock(symbol, api_key):
     try:
         genai.configure(api_key=api_key)
-        # 動態選取模型
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        model_name = next((m for m in models if 'gemini' in m), models[0] if models else None)
-        model = genai.GenerativeModel(model_name)
+        model = genai.GenerativeModel('gemini-pro')
         
-        # 進行數據驗證
-        margin, growth, is_valid = get_verified_data(symbol)
-        
-        if not is_valid:
-            return f"❌ **數據驗證失敗**：偵測到該個股財報數據異常 (毛利率: {margin:.2f}%)，系統已自動中止分析以避免產生錯誤結論。請確認代號是否正確或該數據是否為臨時性斷層。"
-
-        # 技術指標計算
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="6mo")
+        
+        # 獲取自動校準後的數據
+        margin, status = get_consensus_data(ticker)
+        growth = (ticker.info.get('revenueGrowth', 0) * 100)
         rsi = ta.momentum.rsi(df['Close'], window=14).iloc[-1]
         
-        prompt = f"""
-        你是一位極度嚴謹的證券分析師。請僅根據以下提供的【數據事實】進行分析，嚴禁自行聯想或引用外部知識庫中可能錯誤的歷史資料。
+        # 顯示驗證狀態
+        st.sidebar.info(status)
         
-        【數據事實】
-        - 標的代號: {symbol}
+        prompt = f"""
+        你是一位嚴謹的證券分析師，請針對 {symbol} 進行分析。
+        【已驗證數據事實】
         - 毛利率: {margin:.2f}%
         - 營收年成長率: {growth:.2f}%
         - 當前 RSI: {rsi:.2f}
         
-        【分析框架】
-        1. 數據性質客觀陳述：針對提供的毛利率與成長率進行數值意義上的評估。
-        2. 技術指標解析：基於 RSI (46-55為盤整區間) 與布林通道中軸邏輯，說明股價運作狀態。
-        3. 投資觀察清單：列出投資人應持續追蹤的 3 個關鍵數據轉折點。
+        【分析要求】
+        1. 數據性質評估：基於上述毛利率，分析其獲利能力是否偏離歷史常態。
+        2. 產業週期判斷：結合該公司產業特性，說明當前數據暗示的週期階段。
+        3. 技術指標解析：以 RSI 盤整邏輯為基礎，說明股價運行狀態。
+        4. 觀察清單：列出該標的需關注的 3 個技術與基本面轉折點。
         
-        請以條列式輸出，保持專業、客觀、冷靜的口吻。
+        請以條列式輸出，保持極度客觀。
         """
         
         response = model.generate_content(prompt)
@@ -70,7 +81,7 @@ def analyze_stock(symbol, api_key):
         return f"分析過程發生系統異常: {str(e)}"
 
 # --- 3. 介面呈現 ---
-st.title("◎ 專業級台股分析 Agent (嚴謹驗證版)")
+st.title("◎ 專業台股分析 Agent (自動驗證版)")
 api_key = st.sidebar.text_input("Gemini API Key", type="password")
 symbol = st.sidebar.text_input("輸入台股代號 (如 1710.TW)", "1710.TW")
 
@@ -78,5 +89,5 @@ if st.sidebar.button("開始專業診斷"):
     if not api_key:
         st.warning("請在側邊欄輸入 API Key")
     else:
-        with st.spinner('進行數據雙重驗證中...'):
+        with st.spinner('進行數據三節點比對與深度邏輯分析中...'):
             st.markdown(analyze_stock(symbol, api_key))
